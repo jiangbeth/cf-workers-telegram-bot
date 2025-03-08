@@ -211,11 +211,11 @@ export default class TelegramExecutionContext {
             parse_mode,
           });
         }
-        return null;
+        return new Response('No chat id found', { status: 400 });
       case 'inline':
         return await this.replyInline('Response', message, parse_mode);
       default:
-        return null;
+        return new Response('Unsupported update type', { status: 400 });
     }
   }
 }

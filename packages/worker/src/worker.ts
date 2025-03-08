@@ -1,5 +1,6 @@
-import TelegramBot, { TelegramExecutionContext } from '../../main/src/main.js';
+import TelegramBot, { TelegramExecutionContext, TelegramApi } from '../../main/src/main.js';
 import { marked } from 'marked';
+import { WorkflowEntrypoint, WorkflowStep, WorkflowEvent } from 'cloudflare:workers';
 
 export interface Environment {
 	SECRET_TELEGRAM_API_TOKEN: string;
@@ -8,6 +9,49 @@ export interface Environment {
 	AI: Ai;
 	DB: D1Database;
 	R2: R2Bucket;
+	EDIT_MESSAGE_WORKFLOW: Workflow;
+}
+
+interface EditMessageData {
+	inline_message_id: string;
+	text: string;
+	parse_mode?: 'HTML' | 'Markdown' | 'MarkdownV2';
+}
+
+interface Params {
+	message: string;
+	inline_message_id: string;
+	botApi: string;
+}
+
+export class EditMessageWorkflow extends WorkflowEntrypoint<Environment, Params> {
+	async run(event: WorkflowEvent<Params>, step: WorkflowStep) {
+		await step.do(
+			'try to edit a message that might not be sent yet',
+			{
+				retries: {
+					limit: 5,
+					delay: '5 second',
+					backoff: 'exponential',
+				},
+				timeout: '5 minutes',
+			},
+			async () => {
+				const api = new TelegramApi();
+				const botApiUrl = new URL(`https://api.telegram.org/bot${event.payload.botApi}`);
+				const response = await api.editMessageText(botApiUrl.toString(), {
+					inline_message_id: event.payload.inline_message_id,
+					text: event.payload.message,
+					parse_mode: 'HTML',
+				});
+
+				if (!response.ok) {
+					const errorText = await response.text();
+					throw new Error(`Failed to edit message: ${response.status.toString()} ${errorText}`);
+				}
+			},
+		);
+	}
 }
 
 type promiseFunc<T> = (resolve: (result: T) => void, reject: (e?: Error) => void) => Promise<T>;
@@ -98,10 +142,10 @@ export default {
 							if ('response' in response) {
 								await bot.reply(
 									await markdownToHtml(
-										typeof response.response === 'string' 
-											? response.response 
+										typeof response.response === 'string'
+											? response.response
 											: JSON.stringify(response.response)
-									), 
+									),
 									'HTML'
 								);
 							}
@@ -144,17 +188,17 @@ export default {
 								if ('response' in response && response.response) {
 									await bot.reply(
 										await markdownToHtml(
-											typeof response.response === 'string' 
-												? response.response 
+											typeof response.response === 'string'
+												? response.response
 												: JSON.stringify(response.response)
-										), 
+										),
 										'HTML'
 									);
 
 									await env.DB.prepare('INSERT INTO Messages (id, userId, content) VALUES (?, ?, ?)')
 										.bind(
-											crypto.randomUUID(), 
-											bot.update.message?.from.id, 
+											crypto.randomUUID(),
+											bot.update.message?.from.id,
 											`'[INST] ${prompt} [/INST] \n ${typeof response.response === 'string' ? response.response : JSON.stringify(response.response)}'`
 										)
 										.run();
@@ -189,25 +233,25 @@ export default {
 								const fileResponse = await bot.getFile(fileId);
 								const blob = await fileResponse.arrayBuffer();
 								// @ts-expect-error broken bindings
-								const response = await env.AI.run(AI_MODELS.LLAMA, { 
-									messages, 
-									image: [...new Uint8Array(blob)] 
+								const response = await env.AI.run(AI_MODELS.LLAMA, {
+									messages,
+									image: [...new Uint8Array(blob)]
 								});
 
 								if ('response' in response && response.response) {
 									await bot.reply(
 										await markdownToHtml(
-											typeof response.response === 'string' 
-												? response.response 
+											typeof response.response === 'string'
+												? response.response
 												: JSON.stringify(response.response)
-										), 
+										),
 										'HTML'
 									);
 
 									await env.DB.prepare('INSERT INTO Messages (id, userId, content) VALUES (?, ?, ?)')
 										.bind(
-											crypto.randomUUID(), 
-											bot.update.message?.from.id, 
+											crypto.randomUUID(),
+											bot.update.message?.from.id,
 											`'[INST] ${prompt} [/INST] \n ${typeof response.response === 'string' ? response.response : JSON.stringify(response.response)}'`
 										)
 										.run();
@@ -226,21 +270,44 @@ export default {
 							];
 
 							try {
+								// First, send initial response
+								await bot.replyInline(
+									"Thinking...",
+									"Processing your request...",
+									'HTML'
+								);
+
+								// Get the inline_message_id from the update
+								const inlineMessageId = bot.update.inline_query?.id.toString();
+
+								if (!inlineMessageId) {
+									console.error('No inline_message_id found in update');
+									return new Response('No inline_message_id found', { status: 400 });
+								}
+
 								// @ts-expect-error broken bindings
 								const response = await env.AI.run(AI_MODELS.LLAMA, { messages, max_tokens: 100 });
 
 								if ('response' in response) {
-									await bot.replyInline(
-										(typeof response.response === 'string' ? response.response : ''),
-										await markdownToHtml(typeof response.response === 'string' ? response.response : ''),
-										'HTML'
+									const formattedResponse = await markdownToHtml(
+										typeof response.response === 'string' ? response.response : ''
 									);
+
+									await env.EDIT_MESSAGE_WORKFLOW.create({
+										id: crypto.randomUUID(), 
+										params: {
+											message: formattedResponse, 
+											inline_message_id: inlineMessageId,
+											botApi: bot.bot.api.toString()
+										}
+									});
 								}
+								return new Response('ok');
 							} catch (e) {
 								console.error('Error in inline handler:', e);
 								await bot.reply(`Error: ${e as string}`);
+								return new Response(`Error: ${e as string}`, { status: 500 });
 							}
-							break;
 						}
 
 						case 'business_message': {
@@ -259,7 +326,7 @@ export default {
 
 								try {
 									let response;
-									
+
 									if (fileId) {
 										const fileResponse = await bot.getFile(fileId);
 										const blob = await fileResponse.arrayBuffer();
@@ -273,17 +340,17 @@ export default {
 									if ('response' in response && response.response) {
 										await bot.reply(
 											await markdownToHtml(
-												typeof response.response === 'string' 
-													? response.response 
+												typeof response.response === 'string'
+													? response.response
 													: JSON.stringify(response.response)
-											), 
+											),
 											'HTML'
 										);
 
 										await env.DB.prepare('INSERT INTO Messages (id, userId, content) VALUES (?, ?, ?)')
 											.bind(
-												crypto.randomUUID(), 
-												bot.update.business_message?.from.id, 
+												crypto.randomUUID(),
+												bot.update.business_message?.from.id,
 												`'[INST] ${prompt} [/INST] \n ${typeof response.response === 'string' ? response.response : JSON.stringify(response.response)}'`
 											)
 											.run();
